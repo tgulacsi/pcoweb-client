@@ -40,6 +40,7 @@ func main() {
 func Main() error {
 	flagHost := flag.String("host", "192.168.1.143", "host to connect to with ModBus")
 	flagAddr := flag.String("addr", ":7070", "addres to listen on (Prometheus HTTP)")
+	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
 	flag.Parse()
 
 	// Modbus TCP
@@ -73,7 +74,7 @@ func Main() error {
 	act := Aqua11c.NewMeasurement()
 	pre := Aqua11c.NewMeasurement()
 
-	tick := time.NewTicker(3 * time.Second)
+	tick := time.NewTicker(*flagTick)
 	first := true
 	for {
 		if err = bus.Observe(act.Map); err != nil {
