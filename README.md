@@ -1,4 +1,4 @@
-# pcosweb-client
+# pcoweb-client: a Carel pCOWeb card ModBus client as a Prometheus metric exporter 
 This is a simple ModBus client for Carel [pCOWeb cards](https://www.carel.com/bms-building-management-system-na/-/journal_content/56_INSTANCE_i4q5KIMLInKK/10191/55239).
 
 It retrieves the ModBus bits and analogue measurements, exposes them as Prometheus metrics,

@@ -1,4 +1,4 @@
-module github.com/tgulacsi/pcosweb-client
+module github.com/tgulacsi/pcoweb-client
 
 require (
 	github.com/goburrow/modbus v0.1.0
