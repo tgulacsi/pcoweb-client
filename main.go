@@ -16,11 +16,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/smtp"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +34,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+var hostname string
+
 func main() {
 	if err := Main(); err != nil {
 		log.Fatalf("%+v", err)
@@ -39,8 +44,10 @@ func main() {
 
 func Main() error {
 	flagHost := flag.String("host", "192.168.1.143", "host to connect to with ModBus")
-	flagAddr := flag.String("addr", ":7070", "addres to listen on (Prometheus HTTP)")
+	flagAddr := flag.String("addr", "127.0.0.1:7070", "addres to listen on (Prometheus HTTP)")
+	flagAlertTo := flag.String("alert-to", "tamas+a32-heatpump@gulacsi.eu", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
+	flagTest := flag.Bool("test", false, "send test email")
 	flag.Parse()
 
 	// Modbus TCP
@@ -48,6 +55,15 @@ func Main() error {
 	if err != nil {
 		return err
 	}
+	if hostname, err = os.Hostname(); err != nil {
+		return err
+	}
+	if *flagTest {
+		if err = sendAlert(*flagAlertTo, []string{"test"}); err != nil {
+			return err
+		}
+	}
+
 	defer bus.Close()
 
 	mMap := prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -104,7 +120,22 @@ func Main() error {
 			log.Printf("Ints[%d]: %v", i, act.Ints)
 		}
 		if i := pre.Bits.DiffIndex(act.Bits); first || i >= 0 {
-			log.Printf("Bits[%d]: %v", i, act.Bits)
+			log.Printf("Bits[%02d]: %v", i, act.Bits)
+			if *flagAlertTo != "" {
+				var alert []string
+				for _, ab := range bus.AlertBits {
+					for j := i; i < len(act.Bits); j++ {
+						if j == int(ab) && act.Bits[j] {
+							alert = append(alert, bus.PCOType.Bits[ab])
+						}
+					}
+				}
+				if len(alert) != 0 {
+					if err = sendAlert(*flagAlertTo, alert); err != nil {
+						log.Printf("alert to %q: %+v", *flagAlertTo, alert)
+					}
+				}
+			}
 		}
 		if k := pre.Map.DiffIndex(act.Map, 3); first || k != "" {
 			log.Printf("Map[%q]=%d: %v", k, act.Map[k], act.Map)
@@ -118,6 +149,17 @@ func Main() error {
 	}
 
 	return nil
+}
+
+func sendAlert(to string, alerts []string) error {
+	var buf bytes.Buffer
+	buf.WriteString("Subject: ALERT\r\n\r\n")
+	for _, alert := range alerts {
+		buf.WriteString(alert)
+		buf.WriteString("\r\n")
+	}
+	log.Printf("connecting to %q", hostname)
+	return smtp.SendMail(hostname+":25", nil, "pcosweb-client@"+hostname, []string{to}, buf.Bytes())
 }
 
 type Bits []bool
@@ -210,8 +252,10 @@ type Bus struct {
 }
 
 type PCOType struct {
-	Length uint16
-	Names  map[uint16]string
+	Length      uint16
+	Names, Bits map[uint16]string
+	AlertBits   []uint16
+	AlertNames  []string
 }
 
 var Aqua11c = PCOType{
@@ -224,10 +268,21 @@ var Aqua11c = PCOType{
 		6:  "Room1",
 		7:  "Switch %",
 		8:  "Forward temp",
-		9:  "UWV temp",
+		9:  "UWW temp",
 		15: "Solar temp",
-		30: "UWV Switch %",
+		30: "UWW Switch %",
 	},
+	Bits: map[uint16]string{
+		7:  "Forward heating",
+		8:  "UWW",
+		20: "",
+		39: "Heat pump",
+		53: "Source pump",
+		54: "UWW circulation",
+		56: "Make UWW",
+		60: "ERROR",
+	},
+	AlertBits: []uint16{60},
 }
 
 func NewBus(host string, typ PCOType) (*Bus, error) {
