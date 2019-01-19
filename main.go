@@ -52,7 +52,7 @@ func main() {
 func Main() error {
 	flagHost := flag.String("host", "192.168.1.143", "host to connect to with ModBus")
 	flagAddr := flag.String("addr", "127.0.0.1:7070", "addres to listen on (Prometheus HTTP)")
-	flagAlertTo := flag.String("alert-to", "tamas+a32-heatpump@gulacsi.eu", "Prometheus Alert manager")
+	flagAlertTo := flag.String("alert-to", "", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
 	flagTest := flag.Bool("test", false, "send test email")
 	flag.Parse()

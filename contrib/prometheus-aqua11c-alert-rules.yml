@@ -1,0 +1,7 @@
+groups:
+  - name: heatpump
+    rules:
+    - alert: HeatpumpError 
+      expr: max_over_time(modbus_aqua11c_bit{index="b060"}[5m]) > 0.5
+  
+# vim: set et shiftwidth=2:
