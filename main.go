@@ -17,6 +17,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -24,9 +25,15 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	_ "net/http/pprof"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/goburrow/modbus"
 
@@ -85,7 +92,20 @@ func Main() error {
 		[]string{"index"})
 	prometheus.MustRegister(mBit)
 
-	go http.ListenAndServe(*flagAddr, promhttp.Handler())
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		defer cancel()
+		sig := <-ch
+		log.Println("SIGNAL", sig)
+	}()
+	grp, ctx := errgroup.WithContext(ctx)
+
+	http.Handle("/metrics", promhttp.Handler())
+	grp.Go(func() error {
+		return http.ListenAndServe(*flagAddr, nil)
+	})
 
 	act := Aqua11c.NewMeasurement()
 	pre := Aqua11c.NewMeasurement()
@@ -93,6 +113,11 @@ func Main() error {
 	tick := time.NewTicker(*flagTick)
 	first := true
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err = bus.Observe(act.Map); err != nil {
 			return err
 		}
@@ -124,7 +149,7 @@ func Main() error {
 			if *flagAlertTo != "" {
 				var alert []string
 				for _, ab := range bus.AlertBits {
-					for j := i; i < len(act.Bits); j++ {
+					for j := i; j < len(act.Bits); j++ {
 						if j == int(ab) && act.Bits[j] {
 							alert = append(alert, bus.PCOType.Bits[ab])
 						}
@@ -144,6 +169,8 @@ func Main() error {
 
 		pre, act = act, pre
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-tick.C:
 		}
 	}

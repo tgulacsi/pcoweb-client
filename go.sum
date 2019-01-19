@@ -21,4 +21,5 @@ github.com/prometheus/procfs v0.0.0-20181204211112-1dc9a6cbc91a/go.mod h1:c3At6R
 github.com/soniah/gosnmp v0.0.0-20190109014816-922fbec967ca h1:gfXb38vM75M4+N9VdUYQq+UP/qF2Vm+h2VCNS4R66yU=
 github.com/soniah/gosnmp v0.0.0-20190109014816-922fbec967ca/go.mod h1:2Tv1OISIqbjlOCmGzXl+hlZSAHsftdCWHLaLEezhwV8=
 golang.org/x/net v0.0.0-20181201002055-351d144fa1fc/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+golang.org/x/sync v0.0.0-20181108010431-42b317875d0f h1:Bl/8QSvNqXvPGPGXa2z5xUTmV7VDcZyvRZ+QQXkXTZQ=
 golang.org/x/sync v0.0.0-20181108010431-42b317875d0f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
