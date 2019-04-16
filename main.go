@@ -37,8 +37,7 @@ import (
 
 	"github.com/goburrow/modbus"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/VictoriaMetrics/metrics"
 )
 
 var hostname string
@@ -73,25 +72,6 @@ func Main() error {
 
 	defer bus.Close()
 
-	mMap := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "modbus", Subsystem: "aqua11c",
-		Name: "analogue",
-	},
-		[]string{"name"})
-	prometheus.MustRegister(mMap)
-	mInt := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "modbus", Subsystem: "aqua11c",
-		Name: "integer",
-	},
-		[]string{"index"})
-	prometheus.MustRegister(mInt)
-	mBit := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "modbus", Subsystem: "aqua11c",
-		Name: "bit",
-	},
-		[]string{"index"})
-	prometheus.MustRegister(mBit)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
@@ -102,11 +82,14 @@ func Main() error {
 	}()
 	grp, ctx := errgroup.WithContext(ctx)
 
-	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		metrics.WritePrometheus(w, true)
+	})
 	grp.Go(func() error {
 		return http.ListenAndServe(*flagAddr, nil)
 	})
 
+	var mu sync.Mutex
 	act := Aqua11c.NewMeasurement()
 	pre := Aqua11c.NewMeasurement()
 
@@ -121,24 +104,55 @@ func Main() error {
 		if err = bus.Observe(act.Map); err != nil {
 			return err
 		}
-		for k, v := range act.Map {
-			mMap.WithLabelValues(k).Set(float64(v) / 10.0)
+		if first {
+			for k := range act.Map {
+				k := k
+				metrics.NewGauge(fmt.Sprintf("modbus_aqua11c_analogue{name=%q}", k),
+					func() float64 {
+						mu.Lock()
+						v := float64(act.Map[k]) / 10.0
+						mu.Unlock()
+						return v
+					})
+			}
 		}
+
 		if err = bus.Integers(act.Ints, 0); err != nil {
 			return err
 		}
-		for i, v := range act.Ints {
-			mInt.WithLabelValues(fmt.Sprintf("i%03d", i)).Set(float64(v))
+		if first {
+			for i := range act.Ints {
+				i := i
+				metrics.NewGauge(
+					fmt.Sprintf("modbus_aqua11c_integer{index=\"i%03d\"}", i),
+					func() float64 {
+						mu.Lock()
+						v := act.Ints[i]
+						mu.Unlock()
+						return float64(v)
+					})
+			}
 		}
+
 		if err = bus.Bits(act.Bits); err != nil {
 			return err
 		}
-		for i, v := range act.Bits {
-			var j float64
-			if v {
-				j = 1
+		if first {
+			for i := range act.Bits {
+				i := i
+				metrics.NewGauge(
+					fmt.Sprintf("modbus_aqua11c_bit{index=\"b%03d\"}", i),
+					func() float64 {
+						var j float64
+						mu.Lock()
+						b := act.Bits[i]
+						mu.Unlock()
+						if b {
+							j = 1
+						}
+						return j
+					})
 			}
-			mBit.WithLabelValues(fmt.Sprintf("b%03d", i)).Set(j)
 		}
 
 		if i := pre.Ints.DiffIndex(act.Ints); first || i >= 0 {
@@ -167,7 +181,9 @@ func Main() error {
 		}
 		first = false
 
+		mu.Lock()
 		pre, act = act, pre
+		mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
