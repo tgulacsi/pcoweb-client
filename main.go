@@ -323,9 +323,9 @@ var Aqua11c = PCOType{
 		53: "Source pump",
 		54: "UWW circulation",
 		56: "Make UWW",
-		60: "ERROR",
+		60: "Solar pump",
 	},
-	AlertBits: []uint16{60},
+	AlertBits: []uint16{},
 }
 
 func NewBus(host string, typ PCOType) (*Bus, error) {
