@@ -79,6 +79,10 @@ func Main() error {
 		defer cancel()
 		sig := <-ch
 		log.Println("SIGNAL", sig)
+		if p, _ := os.FindProcess(os.Getpid()); p != nil {
+			time.Sleep(time.Second)
+			_ = p.Signal(sig)
+		}
 	}()
 	grp, ctx := errgroup.WithContext(ctx)
 
