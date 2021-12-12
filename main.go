@@ -50,7 +50,7 @@ func main() {
 
 func Main() error {
 	flagHost := flag.String("host", "192.168.1.143", "host to connect to with ModBus")
-	flagAddr := flag.String("addr", "127.0.0.1:7070", "addres to listen on (Prometheus HTTP)")
+	flagAddr := flag.String("addr", "127.0.0.1:7070", "address to listen on (Prometheus HTTP)")
 	flagAlertTo := flag.String("alert-to", "", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
 	flagTest := flag.Bool("test", false, "send test email")
@@ -194,8 +194,6 @@ func Main() error {
 		case <-tick.C:
 		}
 	}
-
-	return nil
 }
 
 func sendAlert(to string, alerts []string) error {
@@ -295,7 +293,6 @@ type Bus struct {
 	mu sync.Mutex
 	modbus.Client
 	handler *modbus.TCPClientHandler
-	buf     *strings.Builder
 }
 
 type PCOType struct {
@@ -320,14 +317,17 @@ var Aqua11c = PCOType{
 		30: "UWW Switch %",
 	},
 	Bits: map[uint16]string{
+		4:  "Planned electric outage",
 		7:  "Forward heating",
 		8:  "UWW",
 		20: "",
 		39: "Heat pump",
+		41: "Source pump?",
 		53: "Source pump",
 		54: "UWW circulation",
 		56: "Make UWW",
 		60: "Solar pump",
+		80: "Preheat",
 	},
 	AlertBits: []uint16{},
 }
