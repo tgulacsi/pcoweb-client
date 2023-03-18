@@ -1,11 +1,11 @@
 module github.com/tgulacsi/pcoweb-client
 
-go 1.17
+go 1.19
 
 require (
-	github.com/VictoriaMetrics/metrics v1.18.1
+	github.com/VictoriaMetrics/metrics v1.23.1
 	github.com/goburrow/modbus v0.1.0
-	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
+	golang.org/x/sync v0.1.0
 )
 
 require (
