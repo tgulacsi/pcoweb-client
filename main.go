@@ -1,4 +1,4 @@
-// Copyright 2019 Tamás Gulácsi
+// Copyright 2019, 2024 Tamás Gulácsi
 //
 //
 //    Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,10 +19,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
+	_ "net/http/pprof"
+	"net/netip"
 	"net/smtp"
 	"os"
 	"os/signal"
@@ -31,59 +35,107 @@ import (
 	"syscall"
 	"time"
 
-	_ "net/http/pprof"
-
 	"golang.org/x/sync/errgroup"
 
-	"github.com/goburrow/modbus"
-
 	"github.com/VictoriaMetrics/metrics"
+	"github.com/goburrow/modbus"
 )
 
 var hostname string
 
 func main() {
 	if err := Main(); err != nil {
-		log.Fatalf("%+v", err)
+		slog.Error("main", "error", err)
+		os.Exit(1)
 	}
 }
 
 func Main() error {
-	flagHost := flag.String("host", "192.168.1.143", "host to connect to with ModBus")
+	flagType := flag.String("type", "aqua11c", "client type (known: aqua11c)")
+	flagHost := flag.String("host", "192.168.100.0/24", "host to connect to with ModBus (can be a CIDR to scan the net)")
 	flagAddr := flag.String("addr", "127.0.0.1:7070", "address to listen on (Prometheus HTTP)")
 	flagAlertTo := flag.String("alert-to", "", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
 	flagTest := flag.Bool("test", false, "send test email")
 	flag.Parse()
 
+	client := Aqua11c
+	switch *flagType {
+	case "", "aqua11c":
+	default:
+		return fmt.Errorf("unknown type %q (known: aqua11c)", *flagType)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	// Modbus TCP
-	bus, err := NewBus(*flagHost, Aqua11c)
-	if err != nil {
-		return err
+	busCh := make(chan *Bus, 1)
+	if strings.IndexByte(*flagHost, '/') >= 0 {
+		netPrefix, err := netip.ParsePrefix(*flagHost)
+		if err != nil {
+			return fmt.Errorf("parse %q as prefix: %w", *flagHost, err)
+		}
+		grp, grpCtx := errgroup.WithContext(ctx)
+		grp.SetLimit(32)
+		errFound := errors.New("found")
+		for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
+			if err := grpCtx.Err(); err != nil {
+				slog.Warn("scan context", "error", err, "ctx", ctx.Err())
+				return err
+			}
+			addr := addr
+			grp.Go(func() error {
+				bus, err := NewBus(grpCtx, addr.String(), client)
+				if err != nil {
+					slog.Debug("scan", "addr", addr, "error", err)
+					return nil
+				}
+				slog.Warn("scan", "found", addr)
+				select {
+				case busCh <- bus:
+				default:
+					if err := bus.Close(); err != nil {
+						slog.Warn("close bus", "addr", addr, "error", err)
+					}
+				}
+				return errFound
+			})
+		}
+		if err := grp.Wait(); err != nil {
+			slog.Warn("scan finished", "error", err)
+			if !errors.Is(err, errFound) {
+				slog.Error("scan", "error", err)
+				return err
+			}
+		}
 	}
+	var bus *Bus
+	select {
+	case bus = <-busCh:
+		slog.Info("found", "bus", bus)
+	default:
+		var err error
+		if bus, err = NewBus(ctx, *flagHost, client); err != nil {
+			slog.Error("NewBus", "addr", *flagHost, "error", err)
+			return err
+		}
+	}
+	var err error
 	if hostname, err = os.Hostname(); err != nil {
+		slog.Error("Hostname", "error", err)
 		return err
 	}
+	slog.Info("have", "bus", bus, "hostname", hostname)
 	if *flagTest {
-		if err = sendAlert(*flagAlertTo, []string{"test"}); err != nil {
+		if err = sendAlert(ctx, *flagAlertTo, []string{"test"}); err != nil {
+			slog.Error("sendAlert", "error", err)
 			return err
 		}
 	}
 
 	defer bus.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		defer cancel()
-		sig := <-ch
-		log.Println("SIGNAL", sig)
-		if p, _ := os.FindProcess(os.Getpid()); p != nil {
-			time.Sleep(time.Second)
-			_ = p.Signal(sig)
-		}
-	}()
 	grp, ctx := errgroup.WithContext(ctx)
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
@@ -94,24 +146,26 @@ func Main() error {
 	})
 
 	var mu sync.Mutex
-	act := Aqua11c.NewMeasurement()
-	pre := Aqua11c.NewMeasurement()
+	act := client.NewMeasurement()
+	pre := client.NewMeasurement()
 
 	tick := time.NewTicker(*flagTick)
 	first := true
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Warn("done", "error", ctx.Err())
 			return ctx.Err()
 		default:
 		}
 		if err = bus.Observe(act.Map); err != nil {
+			slog.Error("Observe", "error", err)
 			return err
 		}
 		if first {
 			for k := range act.Map {
 				k := k
-				metrics.NewGauge(fmt.Sprintf("modbus_aqua11c_analogue{name=%q}", k),
+				metrics.NewGauge(fmt.Sprintf(client.MetricNamePrefix+"analogue{name=%q}", k),
 					func() float64 {
 						mu.Lock()
 						v := float64(act.Map[k]) / 10.0
@@ -122,13 +176,14 @@ func Main() error {
 		}
 
 		if err = bus.Integers(act.Ints, 0); err != nil {
+			slog.Error("Integers", "error", err)
 			return err
 		}
 		if first {
 			for i := range act.Ints {
 				i := i
 				metrics.NewGauge(
-					fmt.Sprintf("modbus_aqua11c_integer{index=\"i%03d\"}", i),
+					fmt.Sprintf(client.MetricNamePrefix+"integer{index=\"i%03d\"}", i),
 					func() float64 {
 						mu.Lock()
 						v := act.Ints[i]
@@ -139,13 +194,14 @@ func Main() error {
 		}
 
 		if err = bus.Bits(act.Bits); err != nil {
+			slog.Error("Bits", "error", err)
 			return err
 		}
 		if first {
 			for i := range act.Bits {
 				i := i
 				metrics.NewGauge(
-					fmt.Sprintf("modbus_aqua11c_bit{index=\"b%03d\"}", i),
+					fmt.Sprintf(client.MetricNamePrefix+"bit{index=\"b%03d\"}", i),
 					func() float64 {
 						var j float64
 						mu.Lock()
@@ -160,10 +216,10 @@ func Main() error {
 		}
 
 		if i := pre.Ints.DiffIndex(act.Ints); first || i >= 0 {
-			log.Printf("Ints[%d]: %v", i, act.Ints)
+			slog.Info("Ints", "i", i, "ints", act.Ints)
 		}
 		if i := pre.Bits.DiffIndex(act.Bits); first || i >= 0 {
-			log.Printf("Bits[%02d]: %v", i, act.Bits)
+			slog.Info("Bits", "i", i, "bits", act.Bits)
 			if *flagAlertTo != "" {
 				var alert []string
 				for _, ab := range bus.AlertBits {
@@ -174,14 +230,14 @@ func Main() error {
 					}
 				}
 				if len(alert) != 0 {
-					if err = sendAlert(*flagAlertTo, alert); err != nil {
-						log.Printf("alert to %q: %+v", *flagAlertTo, alert)
+					if err = sendAlert(ctx, *flagAlertTo, alert); err != nil {
+						slog.Warn("send", "alert", alert, "to", *flagAlertTo)
 					}
 				}
 			}
 		}
 		if k := pre.Map.DiffIndex(act.Map, 3); first || k != "" {
-			log.Printf("Map[%q]=%d: %v", k, act.Map[k], act.Map)
+			slog.Info("Map", "k", k, "values", act.Map)
 		}
 		first = false
 
@@ -196,14 +252,17 @@ func Main() error {
 	}
 }
 
-func sendAlert(to string, alerts []string) error {
+func sendAlert(ctx context.Context, to string, alerts []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var buf bytes.Buffer
 	buf.WriteString("Subject: ALERT\r\n\r\n")
 	for _, alert := range alerts {
 		buf.WriteString(alert)
 		buf.WriteString("\r\n")
 	}
-	log.Printf("connecting to %q", hostname)
+	slog.Info("sendAlert", "connect", hostname)
 	return smtp.SendMail(hostname+":25", nil, "pcosweb-client@"+hostname, []string{to}, buf.Bytes())
 }
 
@@ -288,22 +347,24 @@ func (typ PCOType) NewMeasurement() *Measurement {
 }
 
 type Bus struct {
+	modbus.Client
+	handler *modbus.TCPClientHandler
 	PCOType
 
 	mu sync.Mutex
-	modbus.Client
-	handler *modbus.TCPClientHandler
 }
 
 type PCOType struct {
-	Length      uint16
-	Names, Bits map[uint16]string
-	AlertBits   []uint16
-	AlertNames  []string
+	Names, Bits      map[uint16]string
+	MetricNamePrefix string
+	AlertBits        []uint16
+	AlertNames       []string
+	Length           uint16
 }
 
 var Aqua11c = PCOType{
-	Length: 207,
+	MetricNamePrefix: "modbus_aqua_11c_",
+	Length:           207,
 	Names: map[uint16]string{
 		1:  "Heat engine",
 		2:  "Heat source",
@@ -332,9 +393,21 @@ var Aqua11c = PCOType{
 	AlertBits: []uint16{},
 }
 
-func NewBus(host string, typ PCOType) (*Bus, error) {
-	handler := modbus.NewTCPClientHandler(host + ":502")
-	handler.Timeout = 10 * time.Second
+var dialer = net.Dialer{Timeout: 10 * time.Second}
+
+func NewBus(ctx context.Context, host string, typ PCOType) (*Bus, error) {
+	hostport := net.JoinHostPort(host, "502")
+	if conn, err := dialer.DialContext(ctx, "tcp", hostport); err != nil {
+		return nil, fmt.Errorf("dial %q: %w", hostport, err)
+	} else {
+		conn.Close()
+	}
+	handler := modbus.NewTCPClientHandler(hostport)
+	if dl, ok := ctx.Deadline(); ok {
+		handler.Timeout = time.Until(dl)
+	} else {
+		handler.Timeout = 10 * time.Second
+	}
 	handler.SlaveId = 0x7F
 	//handler.Logger = log.New(os.Stdout, "test: ", log.LstdFlags)
 	if err := handler.Connect(); err != nil {
