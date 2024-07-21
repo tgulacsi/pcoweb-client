@@ -82,7 +82,7 @@ func Main() error {
 		for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
 			if err := grpCtx.Err(); err != nil {
 				slog.Warn("scan context", "error", err, "ctx", ctx.Err())
-				return err
+				break
 			}
 			addr := addr
 			grp.Go(func() error {
@@ -139,9 +139,11 @@ func Main() error {
 	grp, ctx := errgroup.WithContext(ctx)
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		slog.Info(req.Method+" "+req.URL.Path, "headers", req.Header)
 		metrics.WritePrometheus(w, true)
 	})
 	grp.Go(func() error {
+		slog.Info("ListenAndServe", "address", *flagAddr)
 		return http.ListenAndServe(*flagAddr, nil)
 	})
 
