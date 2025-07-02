@@ -1,4 +1,4 @@
-// Copyright 2019, 2024 Tamás Gulácsi
+// Copyright 2019, 2025 Tamás Gulácsi
 //
 //
 //    Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -37,15 +36,20 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/UNO-SOFT/zlog/v2"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goburrow/modbus"
 )
 
-var hostname string
+var (
+	hostname string
+	verbose  = zlog.VerboseVar(1)
+	logger   = zlog.NewLogger(zlog.MaybeConsoleHandler(&verbose, os.Stderr)).SLog()
+)
 
 func main() {
 	if err := Main(); err != nil {
-		slog.Error("main", "error", err)
+		logger.Error("main", "error", err)
 		os.Exit(1)
 	}
 }
@@ -57,6 +61,7 @@ func Main() error {
 	flagAlertTo := flag.String("alert-to", "", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
 	flagTest := flag.Bool("test", false, "send test email")
+	flag.Var(&verbose, "v", "log verbosity")
 	flag.Parse()
 
 	client := Aqua11c
@@ -78,15 +83,15 @@ func Main() error {
 		grp.Go(func() error {
 			bus, err := NewBus(grpCtx, addr, client)
 			if err != nil {
-				slog.Debug("scan", "addr", addr, "error", err)
+				logger.Debug("scan", "addr", addr, "error", err)
 				return nil
 			}
-			slog.Warn("scan", "found", addr)
+			logger.Warn("scan", "found", addr)
 			select {
 			case busCh <- bus:
 			default:
 				if err := bus.Close(); err != nil {
-					slog.Warn("close bus", "addr", addr, "error", err)
+					logger.Warn("close bus", "addr", addr, "error", err)
 				}
 			}
 			return errFound
@@ -103,7 +108,7 @@ func Main() error {
 			}
 			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
 				if err := grpCtx.Err(); err != nil {
-					slog.Warn("scan context", "error", err, "ctx", ctx.Err())
+					logger.Warn("scan context", "error", err, "ctx", ctx.Err())
 					break
 				}
 				add(addr.String())
@@ -111,9 +116,9 @@ func Main() error {
 		}
 	}
 	if err := grp.Wait(); err != nil {
-		slog.Warn("scan finished", "error", err)
+		logger.Warn("scan finished", "error", err)
 		if !errors.Is(err, errFound) {
-			slog.Error("scan", "error", err)
+			logger.Error("scan", "error", err)
 			return err
 		}
 	}
@@ -121,19 +126,19 @@ func Main() error {
 	var bus *Bus
 	select {
 	case bus = <-busCh:
-		slog.Info("found", "bus", bus)
+		logger.Info("found", "bus", bus)
 	default:
 		return fmt.Errorf("not found %v", hosts)
 	}
 	var err error
 	if hostname, err = os.Hostname(); err != nil {
-		slog.Error("Hostname", "error", err)
+		logger.Error("Hostname", "error", err)
 		return err
 	}
-	slog.Info("have", "bus", bus, "hostname", hostname)
+	logger.Info("have", "bus", bus, "hostname", hostname)
 	if *flagTest {
 		if err = sendAlert(ctx, *flagAlertTo, []string{"test"}); err != nil {
-			slog.Error("sendAlert", "error", err)
+			logger.Error("sendAlert", "error", err)
 			return err
 		}
 	}
@@ -143,11 +148,11 @@ func Main() error {
 	grp, ctx = errgroup.WithContext(ctx)
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
-		slog.Info(req.Method+" "+req.URL.Path, "headers", req.Header)
+		logger.Info(req.Method+" "+req.URL.Path, "headers", req.Header)
 		metrics.WritePrometheus(w, true)
 	})
 	grp.Go(func() error {
-		slog.Info("ListenAndServe", "address", *flagAddr)
+		logger.Info("ListenAndServe", "address", *flagAddr)
 		return http.ListenAndServe(*flagAddr, nil)
 	})
 
@@ -160,12 +165,12 @@ func Main() error {
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Warn("done", "error", ctx.Err())
+			logger.Warn("done", "error", ctx.Err())
 			return ctx.Err()
 		default:
 		}
 		if err = bus.Observe(act.Map); err != nil {
-			slog.Error("Observe", "error", err)
+			logger.Error("Observe", "error", err)
 			return err
 		}
 		if first {
@@ -182,7 +187,7 @@ func Main() error {
 		}
 
 		if err = bus.Integers(act.Ints, 0); err != nil {
-			slog.Error("Integers", "error", err)
+			logger.Error("Integers", "error", err)
 			return err
 		}
 		if first {
@@ -200,7 +205,7 @@ func Main() error {
 		}
 
 		if err = bus.Bits(act.Bits); err != nil {
-			slog.Error("Bits", "error", err)
+			logger.Error("Bits", "error", err)
 			return err
 		}
 		if first {
@@ -222,10 +227,10 @@ func Main() error {
 		}
 
 		if i := pre.Ints.DiffIndex(act.Ints); first || i >= 0 {
-			slog.Info("Ints", "i", i, "ints", act.Ints)
+			logger.Info("Ints", "i", i, "ints", act.Ints)
 		}
 		if i := pre.Bits.DiffIndex(act.Bits); first || i >= 0 {
-			slog.Info("Bits", "i", i, "bits", act.Bits)
+			logger.Info("Bits", "i", i, "bits", act.Bits)
 			if *flagAlertTo != "" {
 				var alert []string
 				for _, ab := range bus.AlertBits {
@@ -237,13 +242,13 @@ func Main() error {
 				}
 				if len(alert) != 0 {
 					if err = sendAlert(ctx, *flagAlertTo, alert); err != nil {
-						slog.Warn("send", "alert", alert, "to", *flagAlertTo)
+						logger.Warn("send", "alert", alert, "to", *flagAlertTo)
 					}
 				}
 			}
 		}
 		if k := pre.Map.DiffIndex(act.Map, 3); first || k != "" {
-			slog.Info("Map", "k", k, "values", act.Map)
+			logger.Info("Map", "k", k, "values", act.Map)
 		}
 		first = false
 
@@ -268,7 +273,7 @@ func sendAlert(ctx context.Context, to string, alerts []string) error {
 		buf.WriteString(alert)
 		buf.WriteString("\r\n")
 	}
-	slog.Info("sendAlert", "connect", hostname)
+	logger.Info("sendAlert", "connect", hostname)
 	return smtp.SendMail(hostname+":25", nil, "pcosweb-client@"+hostname, []string{to}, buf.Bytes())
 }
 
