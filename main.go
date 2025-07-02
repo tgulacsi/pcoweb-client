@@ -52,7 +52,7 @@ func main() {
 
 func Main() error {
 	flagType := flag.String("type", "aqua11c", "client type (known: aqua11c)")
-	flagHost := flag.String("host", "192.168.100.0/24", "host to connect to with ModBus (can be a CIDR to scan the net)")
+	flagHost := flag.String("host", "192.168.100.0/24", "host to connect to with ModBus (can be a CIDR to scan the net), can be more of this, space-separated")
 	flagAddr := flag.String("addr", "127.0.0.1:7070", "address to listen on (Prometheus HTTP)")
 	flagAlertTo := flag.String("alert-to", "", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
@@ -71,55 +71,59 @@ func Main() error {
 
 	// Modbus TCP
 	busCh := make(chan *Bus, 1)
-	if strings.IndexByte(*flagHost, '/') >= 0 {
-		netPrefix, err := netip.ParsePrefix(*flagHost)
-		if err != nil {
-			return fmt.Errorf("parse %q as prefix: %w", *flagHost, err)
-		}
-		grp, grpCtx := errgroup.WithContext(ctx)
-		grp.SetLimit(32)
-		errFound := errors.New("found")
-		for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
-			if err := grpCtx.Err(); err != nil {
-				slog.Warn("scan context", "error", err, "ctx", ctx.Err())
-				break
+	grp, grpCtx := errgroup.WithContext(ctx)
+	grp.SetLimit(32)
+	errFound := errors.New("found")
+	add := func(addr string) {
+		grp.Go(func() error {
+			bus, err := NewBus(grpCtx, addr, client)
+			if err != nil {
+				slog.Debug("scan", "addr", addr, "error", err)
+				return nil
 			}
-			addr := addr
-			grp.Go(func() error {
-				bus, err := NewBus(grpCtx, addr.String(), client)
-				if err != nil {
-					slog.Debug("scan", "addr", addr, "error", err)
-					return nil
+			slog.Warn("scan", "found", addr)
+			select {
+			case busCh <- bus:
+			default:
+				if err := bus.Close(); err != nil {
+					slog.Warn("close bus", "addr", addr, "error", err)
 				}
-				slog.Warn("scan", "found", addr)
-				select {
-				case busCh <- bus:
-				default:
-					if err := bus.Close(); err != nil {
-						slog.Warn("close bus", "addr", addr, "error", err)
-					}
+			}
+			return errFound
+		})
+	}
+	hosts := strings.FieldsFunc(*flagHost, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == ',' })
+	for _, host := range hosts {
+		if strings.IndexByte(host, '/') < 0 {
+			add(host)
+		} else {
+			netPrefix, err := netip.ParsePrefix(host)
+			if err != nil {
+				return fmt.Errorf("parse %q as prefix: %w", host, err)
+			}
+			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
+				if err := grpCtx.Err(); err != nil {
+					slog.Warn("scan context", "error", err, "ctx", ctx.Err())
+					break
 				}
-				return errFound
-			})
-		}
-		if err := grp.Wait(); err != nil {
-			slog.Warn("scan finished", "error", err)
-			if !errors.Is(err, errFound) {
-				slog.Error("scan", "error", err)
-				return err
+				add(addr.String())
 			}
 		}
 	}
+	if err := grp.Wait(); err != nil {
+		slog.Warn("scan finished", "error", err)
+		if !errors.Is(err, errFound) {
+			slog.Error("scan", "error", err)
+			return err
+		}
+	}
+
 	var bus *Bus
 	select {
 	case bus = <-busCh:
 		slog.Info("found", "bus", bus)
 	default:
-		var err error
-		if bus, err = NewBus(ctx, *flagHost, client); err != nil {
-			slog.Error("NewBus", "addr", *flagHost, "error", err)
-			return err
-		}
+		return fmt.Errorf("not found %v", hosts)
 	}
 	var err error
 	if hostname, err = os.Hostname(); err != nil {
@@ -136,7 +140,7 @@ func Main() error {
 
 	defer bus.Close()
 
-	grp, ctx := errgroup.WithContext(ctx)
+	grp, ctx = errgroup.WithContext(ctx)
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
 		slog.Info(req.Method+" "+req.URL.Path, "headers", req.Header)
