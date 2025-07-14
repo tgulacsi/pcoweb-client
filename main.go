@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -32,7 +33,6 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -72,7 +72,7 @@ func Main() error {
 		return fmt.Errorf("unknown type %q (known: aqua11c)", *flagType)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	// Modbus TCP
@@ -80,10 +80,29 @@ func Main() error {
 	grp, grpCtx := errgroup.WithContext(ctx)
 	grp.SetLimit(32)
 	errFound := errors.New("found")
+	mAll := metrics.NewCounter("address_scan_all")
+	mFail := metrics.NewCounter("address_scan_fail")
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for {
+			select {
+			case <-done:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+			}
+			logger.Info("scan", slog.Group("address",
+				slog.Uint64("all", mAll.Get()),
+				slog.Uint64("failed", mFail.Get()),
+			))
+		}
+	}()
 	add := func(addr string) {
 		grp.Go(func() error {
 			bus, err := NewBus(grpCtx, addr, client)
 			if err != nil {
+				mFail.Inc()
 				logger.Debug("scan", "addr", addr, "error", err)
 				return nil
 			}
@@ -101,12 +120,18 @@ func Main() error {
 	hosts := strings.FieldsFunc(*flagHost, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == ',' })
 	for _, host := range hosts {
 		if strings.IndexByte(host, '/') < 0 {
+			mAll.Set(1)
 			add(host)
 		} else {
 			netPrefix, err := netip.ParsePrefix(host)
 			if err != nil {
 				return fmt.Errorf("parse %q as prefix: %w", host, err)
 			}
+			n := uint64(0)
+			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
+				n++
+			}
+			mAll.Set(uint64(n))
 			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
 				if err := grpCtx.Err(); err != nil {
 					logger.Warn("scan context", "error", err, "ctx", ctx.Err())
@@ -116,7 +141,9 @@ func Main() error {
 			}
 		}
 	}
-	if err := grp.Wait(); err != nil {
+	err := grp.Wait()
+	close(done)
+	if err != nil {
 		logger.Warn("scan finished", "error", err)
 		if !errors.Is(err, errFound) {
 			logger.Error("scan", "error", err)
@@ -131,7 +158,6 @@ func Main() error {
 	default:
 		return fmt.Errorf("not found %v", hosts)
 	}
-	var err error
 	if hostname, err = os.Hostname(); err != nil {
 		logger.Error("Hostname", "error", err)
 		return err
