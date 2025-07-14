@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -29,6 +30,7 @@ import (
 	"net/smtp"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -149,6 +151,15 @@ func Main() error {
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
 		logger.Info(req.Method+" "+req.URL.Path, "headers", req.Header)
+		if s := req.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); s != "" {
+			if f, err := strconv.ParseFloat(s, 32); err != nil {
+				logger.Warn("X-Prometheus-Scrape-Timeout-Seconds", "header", s, "error", err)
+			} else {
+				ctx, cancel := context.WithTimeout(req.Context(), time.Duration(float64(time.Second)*f))
+				defer cancel()
+				req = req.WithContext(ctx)
+			}
+		}
 		metrics.WritePrometheus(w, true)
 	})
 	grp.Go(func() error {
@@ -156,11 +167,11 @@ func Main() error {
 		return http.ListenAndServe(*flagAddr, nil)
 	})
 
-	var mu sync.Mutex
+	var mu sync.RWMutex
 	act := client.NewMeasurement()
-	pre := client.NewMeasurement()
+	var alert []string
 
-	tick := time.NewTicker(*flagTick)
+	timer := time.NewTimer(*flagTick)
 	first := true
 	for {
 		select {
@@ -169,45 +180,64 @@ func Main() error {
 			return ctx.Err()
 		default:
 		}
-		if err = bus.Observe(act.Map); err != nil {
+		mu.RLock()
+		pre := act
+		mu.RUnlock()
+
+		start := time.Now()
+		mu.Lock()
+		err = bus.Observe(act.Map)
+		mu.Unlock()
+		if err != nil {
 			logger.Error("Observe", "error", err)
 			return err
 		}
+		logger.Debug("Observe Map", "dur", time.Since(start).String())
 		if first {
 			for k := range act.Map {
 				k := k
 				metrics.NewGauge(fmt.Sprintf(client.MetricNamePrefix+"analogue{name=%q}", k),
 					func() float64 {
-						mu.Lock()
+						mu.RLock()
 						v := float64(act.Map[k]) / 10.0
-						mu.Unlock()
+						mu.RUnlock()
 						return v
 					})
 			}
 		}
 
-		if err = bus.Integers(act.Ints, 0); err != nil {
+		start = time.Now()
+		mu.Lock()
+		err = bus.Integers(act.Ints, 0)
+		mu.Unlock()
+		if err != nil {
 			logger.Error("Integers", "error", err)
 			return err
 		}
+		logger.Debug("Observe Ints", "dur", time.Since(start).String())
 		if first {
 			for i := range act.Ints {
 				i := i
 				metrics.NewGauge(
 					fmt.Sprintf(client.MetricNamePrefix+"integer{index=\"i%03d\"}", i),
 					func() float64 {
-						mu.Lock()
+						mu.RLock()
 						v := act.Ints[i]
-						mu.Unlock()
+						mu.RUnlock()
 						return float64(v)
 					})
 			}
 		}
 
-		if err = bus.Bits(act.Bits); err != nil {
+		start = time.Now()
+		mu.Lock()
+		err = bus.Bits(act.Bits)
+		mu.Unlock()
+		if err != nil {
 			logger.Error("Bits", "error", err)
 			return err
 		}
+		logger.Debug("Observe Bits", "dur", time.Since(start).String())
 		if first {
 			for i := range act.Bits {
 				i := i
@@ -215,9 +245,9 @@ func Main() error {
 					fmt.Sprintf(client.MetricNamePrefix+"bit{index=\"b%03d\"}", i),
 					func() float64 {
 						var j float64
-						mu.Lock()
+						mu.RLock()
 						b := act.Bits[i]
-						mu.Unlock()
+						mu.RUnlock()
 						if b {
 							j = 1
 						}
@@ -226,13 +256,17 @@ func Main() error {
 			}
 		}
 
+		mu.RLock()
+		if k := pre.Map.DiffIndex(act.Map, 3); first || k != "" {
+			logger.Info("Map", "k", k, "values", act.Map)
+		}
 		if i := pre.Ints.DiffIndex(act.Ints); first || i >= 0 {
 			logger.Info("Ints", "i", i, "ints", act.Ints)
 		}
+		alert = alert[:0]
 		if i := pre.Bits.DiffIndex(act.Bits); first || i >= 0 {
 			logger.Info("Bits", "i", i, "bits", act.Bits)
 			if *flagAlertTo != "" {
-				var alert []string
 				for _, ab := range bus.AlertBits {
 					for j := i; j < len(act.Bits); j++ {
 						if j == int(ab) && act.Bits[j] {
@@ -240,25 +274,23 @@ func Main() error {
 						}
 					}
 				}
-				if len(alert) != 0 {
-					if err = sendAlert(ctx, *flagAlertTo, alert); err != nil {
-						logger.Warn("send", "alert", alert, "to", *flagAlertTo)
-					}
-				}
 			}
 		}
-		if k := pre.Map.DiffIndex(act.Map, 3); first || k != "" {
-			logger.Info("Map", "k", k, "values", act.Map)
+		mu.RUnlock()
+
+		if len(alert) != 0 {
+			if err = sendAlert(ctx, *flagAlertTo, alert); err != nil {
+				logger.Warn("send", "alert", alert, "to", *flagAlertTo)
+			}
 		}
 		first = false
 
-		mu.Lock()
-		pre, act = act, pre
-		mu.Unlock()
+		timer.Reset(*flagTick - (*flagTick / 4) +
+			time.Duration(rand.Int64N(int64(*flagTick/4))))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-tick.C:
+		case <-timer.C:
 		}
 	}
 }
