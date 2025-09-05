@@ -23,7 +23,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -33,6 +32,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -40,6 +40,7 @@ import (
 	"github.com/UNO-SOFT/zlog/v2"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goburrow/modbus"
+	"github.com/rogpeppe/retry"
 )
 
 var (
@@ -155,6 +156,7 @@ func Main() error {
 	select {
 	case bus = <-busCh:
 		logger.Info("found", "bus", bus)
+		defer bus.Close()
 	default:
 		return fmt.Errorf("not found %v", hosts)
 	}
@@ -170,97 +172,68 @@ func Main() error {
 		}
 	}
 
-	defer bus.Close()
-
-	grp, ctx = errgroup.WithContext(ctx)
-
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
 		logger.Info(req.Method+" "+req.URL.Path, "headers", req.Header)
 		metrics.WritePrometheus(w, true)
 	})
 
+	grp, ctx = errgroup.WithContext(ctx)
 	grp.Go(func() error {
-		var mu sync.RWMutex
-		act := client.NewMeasurement()
+		var A, B atomic.Value
+		A.Store(client.NewMeasurement())
+		B.Store(client.NewMeasurement())
 		var alert []string
 
-		timer := time.NewTimer(*flagTick)
+		strategy := retry.Strategy{Delay: *flagTick}
 		first := true
-		for {
-			select {
-			case <-ctx.Done():
-				logger.Warn("done", "error", ctx.Err())
-				return ctx.Err()
-			default:
-			}
-			mu.RLock()
-			pre := act
-			mu.RUnlock()
+		for iter := strategy.Start(); ; {
+			nxt := B.Load().(*Measurement)
 
 			start := time.Now()
-			mu.Lock()
-			err = bus.Observe(act.Map)
-			mu.Unlock()
-			if err != nil {
+			if err = bus.Observe(nxt.Map); err != nil {
 				logger.Error("Observe", "error", err)
 				return err
 			}
-			logger.Debug("Observe Map", "dur", time.Since(start).String())
-			if first {
-				for k := range act.Map {
-					k := k
-					metrics.NewGauge(fmt.Sprintf(client.MetricNamePrefix+"analogue{name=%q}", k),
-						func() float64 {
-							mu.RLock()
-							v := float64(act.Map[k]) / 10.0
-							mu.RUnlock()
-							return v
-						})
-				}
-			}
-
-			start = time.Now()
-			mu.Lock()
-			err = bus.Integers(act.Ints, 0)
-			mu.Unlock()
-			if err != nil {
+			if err = bus.Integers(nxt.Ints, 0); err != nil {
 				logger.Error("Integers", "error", err)
 				return err
 			}
-			logger.Debug("Observe Ints", "dur", time.Since(start).String())
+			if err = bus.Bits(nxt.Bits); err != nil {
+				logger.Error("Bits", "error", err)
+				return err
+			}
+			logger.Info("Observe", "dur", time.Since(start).String())
+
+			pre := A.Swap(nxt).(*Measurement)
+			B.Store(pre)
+
 			if first {
-				for i := range act.Ints {
+				for k := range nxt.Map {
+					k := k
+					metrics.NewGauge(fmt.Sprintf(client.MetricNamePrefix+"analogue{name=%q}", k),
+						func() float64 {
+							v := float64(A.Load().(*Measurement).Map[k]) / 10.0
+							return v
+						})
+				}
+
+				for i := range nxt.Ints {
 					i := i
 					metrics.NewGauge(
 						fmt.Sprintf(client.MetricNamePrefix+"integer{index=\"i%03d\"}", i),
 						func() float64 {
-							mu.RLock()
-							v := act.Ints[i]
-							mu.RUnlock()
+							v := A.Load().(*Measurement).Ints[i]
 							return float64(v)
 						})
 				}
-			}
 
-			start = time.Now()
-			mu.Lock()
-			err = bus.Bits(act.Bits)
-			mu.Unlock()
-			if err != nil {
-				logger.Error("Bits", "error", err)
-				return err
-			}
-			logger.Debug("Observe Bits", "dur", time.Since(start).String())
-			if first {
-				for i := range act.Bits {
+				for i := range nxt.Bits {
 					i := i
 					metrics.NewGauge(
 						fmt.Sprintf(client.MetricNamePrefix+"bit{index=\"b%03d\"}", i),
 						func() float64 {
 							var j float64
-							mu.RLock()
-							b := act.Bits[i]
-							mu.RUnlock()
+							b := A.Load().(*Measurement).Bits[i]
 							if b {
 								j = 1
 							}
@@ -269,27 +242,25 @@ func Main() error {
 				}
 			}
 
-			mu.RLock()
-			if k := pre.Map.DiffIndex(act.Map, 3); first || k != "" {
-				logger.Info("Map", "k", k, "values", act.Map)
+			if k := pre.Map.DiffIndex(nxt.Map, 3); first || k != "" {
+				logger.Info("Map", "k", k, "values", nxt.Map)
 			}
-			if i := pre.Ints.DiffIndex(act.Ints); first || i >= 0 {
-				logger.Info("Ints", "i", i, "ints", act.Ints)
+			if i := pre.Ints.DiffIndex(nxt.Ints); first || i >= 0 {
+				logger.Info("Ints", "i", i, "ints", nxt.Ints)
 			}
 			alert = alert[:0]
-			if i := pre.Bits.DiffIndex(act.Bits); first || i >= 0 {
-				logger.Info("Bits", "i", i, "bits", act.Bits)
+			if i := pre.Bits.DiffIndex(nxt.Bits); first || i >= 0 {
+				logger.Info("Bits", "i", i, "bits", nxt.Bits)
 				if *flagAlertTo != "" {
 					for _, ab := range bus.AlertBits {
-						for j := i; j < len(act.Bits); j++ {
-							if j == int(ab) && act.Bits[j] {
+						for j := i; j < len(nxt.Bits); j++ {
+							if j == int(ab) && nxt.Bits[j] {
 								alert = append(alert, bus.PCOType.Bits[ab])
 							}
 						}
 					}
 				}
 			}
-			mu.RUnlock()
 
 			if len(alert) != 0 {
 				if err = sendAlert(ctx, *flagAlertTo, alert); err != nil {
@@ -298,19 +269,22 @@ func Main() error {
 			}
 			first = false
 
-			timer.Reset(*flagTick - (*flagTick / 4) +
-				time.Duration(rand.Int64N(int64(*flagTick/4))))
-			select {
-			case <-ctx.Done():
+			if !iter.Next(ctx.Done()) {
 				return ctx.Err()
-			case <-timer.C:
 			}
 		}
 	})
 
 	grp.Go(func() error {
-		logger.Info("ListenAndServe", "address", *flagAddr)
-		return http.ListenAndServe(*flagAddr, nil)
+		server := http.Server{Addr: *flagAddr, Handler: http.DefaultServeMux}
+		logger.Info("ListenAndServe", "address", server.Addr)
+		go func() {
+			<-ctx.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			server.Shutdown(ctx)
+			cancel()
+		}()
+		return server.ListenAndServe()
 	})
 	return grp.Wait()
 }
