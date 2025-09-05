@@ -14,7 +14,6 @@ require (
 require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/goburrow/serial v0.1.0 // indirect
-	github.com/rogpeppe/retry v0.1.0 // indirect
 	github.com/valyala/fastrand v1.1.0 // indirect
 	github.com/valyala/histogram v1.2.0 // indirect
 	golang.org/x/exp v0.0.0-20250819193227-8b4c13bb791b // indirect

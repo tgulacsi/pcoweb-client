@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -40,7 +41,6 @@ import (
 	"github.com/UNO-SOFT/zlog/v2"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/goburrow/modbus"
-	"github.com/rogpeppe/retry"
 )
 
 var (
@@ -184,9 +184,10 @@ func Main() error {
 		B.Store(client.NewMeasurement())
 		var alert []string
 
-		strategy := retry.Strategy{Delay: *flagTick}
 		first := true
-		for iter := strategy.Start(); ; {
+		var timer *time.Timer
+		Q := *flagTick / 4
+		for {
 			nxt := B.Load().(*Measurement)
 
 			start := time.Now()
@@ -269,7 +270,15 @@ func Main() error {
 			}
 			first = false
 
-			if !iter.Next(ctx.Done()) {
+			d := Q*3 + (Q*2)*time.Duration(rand.ExpFloat64())
+			if timer == nil {
+				timer = time.NewTimer(d)
+			} else {
+				timer.Reset(d)
+			}
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
 				return ctx.Err()
 			}
 		}
