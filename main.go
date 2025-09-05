@@ -187,6 +187,7 @@ func Main() error {
 		first := true
 		var timer *time.Timer
 		Q := *flagTick / 4
+		Q2, Q3 := Q*2, Q*3
 		for {
 			nxt := B.Load().(*Measurement)
 
@@ -270,7 +271,7 @@ func Main() error {
 			}
 			first = false
 
-			d := Q*3 + (Q*2)*time.Duration(rand.ExpFloat64())
+			d := Q3 + time.Duration(float32(Q2)*rand.Float32())
 			if timer == nil {
 				timer = time.NewTimer(d)
 			} else {
