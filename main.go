@@ -23,7 +23,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -31,6 +30,7 @@ import (
 	"net/smtp"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,8 +172,25 @@ func Main() error {
 		}
 	}
 
+	nudgeCh := make(chan (chan<- struct{}))
+
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, req *http.Request) {
-		logger.Info(req.Method+" "+req.URL.Path, "headers", req.Header)
+		ch := make(chan struct{}, 1)
+		nudgeCh <- ch
+		timeout := 10 * time.Second
+		if f, _ := strconv.ParseFloat(req.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"), 64); f != 0 {
+			timeout = time.Duration(f * float64(time.Second))
+		}
+		ctx, cancel := context.WithTimeout(req.Context(), timeout)
+		defer cancel()
+		dl, _ := ctx.Deadline()
+		logger.Info(req.Method+" "+req.URL.Path, "headers", req.Header, "deadline", dl)
+
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			logger.Error("nudge timed out", "error", ctx.Err())
+		}
 		metrics.WritePrometheus(w, true)
 	})
 
@@ -185,10 +202,13 @@ func Main() error {
 		var alert []string
 
 		first := true
-		var timer *time.Timer
-		Q := *flagTick / 4
-		Q2, Q3 := Q*2, Q*3
-		for {
+		var last time.Time
+		for ch := range nudgeCh {
+			if !last.IsZero() && time.Since(last) < *flagTick {
+				close(ch)
+				continue
+			}
+
 			nxt := B.Load().(*Measurement)
 
 			start := time.Now()
@@ -208,6 +228,7 @@ func Main() error {
 
 			pre := A.Swap(nxt).(*Measurement)
 			B.Store(pre)
+			last = start
 
 			if first {
 				for k := range nxt.Map {
@@ -244,6 +265,8 @@ func Main() error {
 				}
 			}
 
+			close(ch)
+
 			if k := pre.Map.DiffIndex(nxt.Map, 3); first || k != "" {
 				logger.Info("Map", "k", k, "values", nxt.Map)
 			}
@@ -270,19 +293,8 @@ func Main() error {
 				}
 			}
 			first = false
-
-			d := Q3 + time.Duration(float32(Q2)*rand.Float32())
-			if timer == nil {
-				timer = time.NewTimer(d)
-			} else {
-				timer.Reset(d)
-			}
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
 		}
+		return nil
 	})
 
 	grp.Go(func() error {
@@ -290,6 +302,7 @@ func Main() error {
 		logger.Info("ListenAndServe", "address", server.Addr)
 		go func() {
 			<-ctx.Done()
+			close(nudgeCh)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			server.Shutdown(ctx)
 			cancel()
