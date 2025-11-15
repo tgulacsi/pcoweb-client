@@ -232,7 +232,6 @@ func Main() error {
 
 			if first {
 				for k := range nxt.Map {
-					k := k
 					metrics.NewGauge(fmt.Sprintf(client.MetricNamePrefix+"analogue{name=%q}", k),
 						func() float64 {
 							v := float64(A.Load().(*Measurement).Map[k]) / 10.0
@@ -241,7 +240,6 @@ func Main() error {
 				}
 
 				for i := range nxt.Ints {
-					i := i
 					metrics.NewGauge(
 						fmt.Sprintf(client.MetricNamePrefix+"integer{index=\"i%03d\"}", i),
 						func() float64 {
@@ -251,7 +249,6 @@ func Main() error {
 				}
 
 				for i := range nxt.Bits {
-					i := i
 					metrics.NewGauge(
 						fmt.Sprintf(client.MetricNamePrefix+"bit{index=\"b%03d\"}", i),
 						func() float64 {
@@ -504,7 +501,7 @@ func (bus *Bus) Bits(bits []bool) error {
 	for i := 0; i+1 < len(results); i += 2 {
 		for k := range []int{1, 0} {
 			res := results[i+k]
-			for j := uint8(0); j < 8; j++ {
+			for j := range uint8(8) {
 				bits[n] = false
 				if res&(1<<j) != 0 {
 					bits[n] = true
@@ -530,7 +527,7 @@ func (bus *Bus) Integers(dest []uint16, offset int) error {
 func (bus *Bus) Coils(bits []bool, offset int) error {
 	results, err := bus.Client.ReadCoils(uint16(offset)+1, uint16(len(bits)))
 	for i, b := range results {
-		for j := uint(0); j < 8; j++ {
+		for j := range uint(8) {
 			bits[uint(i)*8+j] = b&(1<<j) != 0
 		}
 	}
