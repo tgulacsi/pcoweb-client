@@ -10,6 +10,7 @@ ARGS=(
 # Get user-defined additional arguments
 USER_ARGS="$(bashio::config 'additionalArguments')"
 
+bashio::log.info "Starting pcosweb-client ${ARGS[*]} $USER_ARGS"
 if ! "/apps/pcosweb-client" "${ARGS[@]}" $USER_ARGS
 then
     bashio::log.error "Error starting pcosweb client, retrying without \`additionalArguments\`: ${USER_ARGS}"
