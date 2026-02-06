@@ -37,3 +37,13 @@ One configuration is included:
 **WARNING!** This is an *experimental* mapping!
 I've paired the analogue values with the values that can be read on the heat pump,
 and the bits by inspecting the changes in the bit's value and the analogue values.
+
+# Home-Assistant
+## Installation and configuration
+
+1. Add the repository. (Quick link: [![Open your Home Assistant instance and show the Supervisor add-on store.](https://my.home-assistant.io/badges/supervisor_addon.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Ftgulacsi%2Fpcosweb-client) )
+    * **Add the repository** (click 3 dots on the top right of the screen). Repository URL: *https://github.com/tgulacsi/pcosweb-client*
+    * Refresh/reload your browser tab/window
+
+2. **Install** the add-on:
+    * Find, and **install** the PCOSWeb Client add-on

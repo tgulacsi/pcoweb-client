@@ -1,0 +1,27 @@
+name: PCOSWeb
+version: "1.134.0"
+slug: pcosweb_client
+description: PCOSWeb client (Rehau Aqua 11C water-water heatpump)
+webui: "http://[HOST]:[PORT:7070]/"
+ingress: true
+ingress_port: 7070
+ingress_entry: /metrics
+host_network: true
+ports:
+  7070/tcp: 7070
+arch:
+  - armv7
+  - aarch64
+  - amd64
+init: false
+map:
+  - addon_config
+options:
+  host: "192.168.1.0/24 192.168.100.0/24"
+  port: 7070
+  additionalArguments: ""
+schema:
+  host: "str?"
+  port: int
+  additionalArguments: "str?"
+

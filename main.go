@@ -1,4 +1,4 @@
-// Copyright 2019, 2025 Tamás Gulácsi
+// Copyright 2019, 2026 Tamás Gulácsi
 //
 //
 //    Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,7 +58,7 @@ func main() {
 
 func Main() error {
 	flagType := flag.String("type", "aqua11c", "client type (known: aqua11c)")
-	flagHost := flag.String("host", "192.168.100.0/24", "host to connect to with ModBus (can be a CIDR to scan the net), can be more of this, space-separated")
+	flagHost := flag.String("host", "192.168.1.0/24 192.168.100.0/24", "host to connect to with ModBus (can be a CIDR to scan the net), can be more of this, space-separated")
 	flagAddr := flag.String("addr", "127.0.0.1:7070", "address to listen on (Prometheus HTTP)")
 	flagAlertTo := flag.String("alert-to", "", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")

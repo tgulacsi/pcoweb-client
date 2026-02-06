@@ -1,0 +1,21 @@
+#!/usr/bin/with-contenv bashio
+set -e
+
+ARGS=(
+  "--addr=0.0.0.0:$(bashio::config 'port')"
+  "--host=$(bashio::config 'host')"
+)
+
+
+# Get user-defined additional arguments
+USER_ARGS="$(bashio::config 'additionalArguments')"
+
+if ! "/apps/pcosweb-client" "${ARGS[@]}" $USER_ARGS
+then
+    bashio::log.error "Error starting pcosweb client, retrying without \`additionalArguments\`: ${USER_ARGS}"
+    if ! "/apps/pcosweb-client" "${ARGS[@]}"
+    then
+        bashio::log.fatal "Error starting pcosweb client"
+    fi
+fi
+
