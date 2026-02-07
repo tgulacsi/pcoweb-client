@@ -3,12 +3,11 @@ version: "0.0.1"
 slug: pcosweb_client
 description: PCOSWeb client (Rehau Aqua 11C water-water heatpump)
 webui: "http://[HOST]:[PORT:7070]/"
-ingress: true
-ingress_port: 7070
-ingress_entry: /metrics
 host_network: true
 ports:
   7070/tcp: 7070
+ports_description:
+  7070/tcp: port to listen on for Prometheus /metrics
 arch:
   - armv7
   - aarch64

@@ -28,6 +28,7 @@ import (
 	_ "net/http/pprof"
 	"net/netip"
 	"net/smtp"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -63,8 +64,20 @@ func Main() error {
 	flagAlertTo := flag.String("alert-to", "", "Prometheus Alert manager")
 	flagTick := flag.Duration("tick", 10*time.Second, "time between measurements")
 	flagTest := flag.Bool("test", false, "send test email")
+	flagPushMetricsURL := flag.String("pushmetrics.url", "", "push metrics to this url (default path is /api/v1/import/prometheus)")
 	flag.Var(&verbose, "v", "log verbosity")
 	flag.Parse()
+
+	if *flagPushMetricsURL != "" {
+		U, err := url.Parse(*flagPushMetricsURL)
+		if err != nil {
+			return err
+		}
+		if U.Path == "" || U.Path == "/" {
+			U.Path = "/api/v1/import/prometheus"
+		}
+		*flagPushMetricsURL = U.String()
+	}
 
 	client := Aqua11c
 	switch *flagType {
@@ -77,90 +90,12 @@ func Main() error {
 	defer cancel()
 
 	// Modbus TCP
-	busCh := make(chan *Bus, 1)
-	grp, grpCtx := errgroup.WithContext(ctx)
-	grp.SetLimit(32)
-	errFound := errors.New("found")
-	mAll := metrics.NewCounter("address_scan_all")
-	mFail := metrics.NewCounter("address_scan_fail")
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		for {
-			select {
-			case <-done:
-				ticker.Stop()
-				return
-			case <-ticker.C:
-			}
-			logger.Info("scan", slog.Group("address",
-				slog.Uint64("all", mAll.Get()),
-				slog.Uint64("failed", mFail.Get()),
-			))
-		}
-	}()
-	add := func(addr string) {
-		grp.Go(func() error {
-			bus, err := NewBus(grpCtx, addr, client)
-			if err != nil {
-				mFail.Inc()
-				logger.Debug("scan", "addr", addr, "error", err)
-				return nil
-			}
-			logger.Warn("scan", "found", addr)
-			select {
-			case busCh <- bus:
-			default:
-				if err := bus.Close(); err != nil {
-					logger.Warn("close bus", "addr", addr, "error", err)
-				}
-			}
-			return errFound
-		})
-	}
-	hosts := strings.FieldsFunc(*flagHost, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == ',' })
-	for _, host := range hosts {
-		if strings.IndexByte(host, '/') < 0 {
-			mAll.Set(1)
-			add(host)
-		} else {
-			netPrefix, err := netip.ParsePrefix(host)
-			if err != nil {
-				return fmt.Errorf("parse %q as prefix: %w", host, err)
-			}
-			n := uint64(0)
-			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
-				n++
-			}
-			mAll.Set(uint64(n))
-			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
-				if err := grpCtx.Err(); err != nil {
-					logger.Warn("scan context", "error", err, "ctx", ctx.Err())
-					break
-				}
-				add(addr.String())
-			}
-		}
-	}
-	err := grp.Wait()
-	close(done)
+	bus, err := findBus(ctx, *flagHost, client)
 	if err != nil {
-		logger.Warn("scan finished", "error", err)
-		if !errors.Is(err, errFound) {
-			logger.Error("scan", "error", err)
-			return err
-		}
+		return err
 	}
-
-	var bus *Bus
-	select {
-	case bus = <-busCh:
-		logger.Info("found", "bus", bus)
-		defer bus.Close()
-	default:
-		return fmt.Errorf("not found %v", hosts)
-	}
-	if hostname, err = os.Hostname(); err != nil {
+	hostname, err := os.Hostname()
+	if err != nil {
 		logger.Error("Hostname", "error", err)
 		return err
 	}
@@ -194,7 +129,52 @@ func Main() error {
 		metrics.WritePrometheus(w, true)
 	})
 
-	grp, ctx = errgroup.WithContext(ctx)
+	grp, ctx := errgroup.WithContext(ctx)
+	if *flagPushMetricsURL != "" {
+		grp.Go(func() error {
+			var buf bytes.Buffer
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-ticker.C:
+				}
+				ch := make(chan struct{}, 1)
+				nudgeCh <- ch
+				if err := func() error {
+					select {
+					case <-ch:
+					case <-time.After(10 * time.Second):
+						logger.Warn("nudge timed out")
+					}
+					buf.Reset()
+					metrics.WritePrometheus(&buf, true)
+					ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+					req, err := http.NewRequestWithContext(ctx, "POST", *flagPushMetricsURL, bytes.NewReader(buf.Bytes()))
+					if err != nil {
+						return err
+					}
+					logger.Debug("push", "to", req.URL.String())
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						return err
+					}
+					defer resp.Body.Close()
+					logger.Info("push", "to", req.URL.String(), "got", resp.Status)
+					if resp.StatusCode >= 400 {
+						return fmt.Errorf("got %s", resp.Status)
+					}
+					return nil
+				}(); err != nil {
+					logger.Error("push", "url", *flagPushMetricsURL, "error", err)
+				}
+			}
+		})
+	}
+
 	grp.Go(func() error {
 		var A, B atomic.Value
 		A.Store(client.NewMeasurement())
@@ -321,6 +301,92 @@ func sendAlert(ctx context.Context, to string, alerts []string) error {
 	}
 	logger.Info("sendAlert", "connect", hostname)
 	return smtp.SendMail(hostname+":25", nil, "pcosweb-client@"+hostname, []string{to}, buf.Bytes())
+}
+
+func findBus(ctx context.Context, host string, client PCOType) (*Bus, error) {
+	busCh := make(chan *Bus, 1)
+	grp, grpCtx := errgroup.WithContext(ctx)
+	grp.SetLimit(32)
+	errFound := errors.New("found")
+	mAll := metrics.NewCounter("address_scan_all")
+	mFail := metrics.NewCounter("address_scan_fail")
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for {
+			select {
+			case <-done:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+			}
+			logger.Info("scan", slog.Group("address",
+				slog.Uint64("all", mAll.Get()),
+				slog.Uint64("failed", mFail.Get()),
+			))
+		}
+	}()
+	add := func(addr string) {
+		grp.Go(func() error {
+			bus, err := NewBus(grpCtx, addr, client)
+			if err != nil {
+				mFail.Inc()
+				logger.Debug("scan", "addr", addr, "error", err)
+				return nil
+			}
+			logger.Warn("scan", "found", addr)
+			select {
+			case busCh <- bus:
+			default:
+				if err := bus.Close(); err != nil {
+					logger.Warn("close bus", "addr", addr, "error", err)
+				}
+			}
+			return errFound
+		})
+	}
+	hosts := strings.FieldsFunc(host, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == ',' })
+	for _, host := range hosts {
+		if strings.IndexByte(host, '/') < 0 {
+			mAll.Set(1)
+			add(host)
+		} else {
+			netPrefix, err := netip.ParsePrefix(host)
+			if err != nil {
+				return nil, fmt.Errorf("parse %q as prefix: %w", host, err)
+			}
+			n := uint64(0)
+			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
+				n++
+			}
+			mAll.Set(uint64(n))
+			for addr := netPrefix.Addr(); addr.IsValid() && netPrefix.Contains(addr); addr = addr.Next() {
+				if err := grpCtx.Err(); err != nil {
+					logger.Warn("scan context", "error", err, "ctx", ctx.Err())
+					break
+				}
+				add(addr.String())
+			}
+		}
+	}
+	err := grp.Wait()
+	close(done)
+	if err != nil {
+		logger.Warn("scan finished", "error", err)
+		if !errors.Is(err, errFound) {
+			logger.Error("scan", "error", err)
+			return nil, err
+		}
+	}
+
+	var bus *Bus
+	select {
+	case bus = <-busCh:
+		logger.Info("found", "bus", bus)
+		return bus, nil
+	default:
+		return nil, fmt.Errorf("not found %v", hosts)
+	}
 }
 
 type Bits []bool
